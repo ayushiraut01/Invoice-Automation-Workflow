@@ -1,0 +1,11 @@
+{
+  "name": "invoice-automation",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "jest tests/functions.test.js"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
