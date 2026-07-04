@@ -1,0 +1,347 @@
+{
+  "name": "Invoice Automation - 2. Approval Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 15 }] }
+      },
+      "id": "a1-cron",
+      "name": "Cron - Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_INVOICES}}" },
+        "filterByFormula": "=AND({Send for Approval} = TRUE(), {Application Status} = 'Draft')",
+        "options": {}
+      },
+      "id": "a2-search-pending",
+      "name": "Airtable - Find Invoices Pending Approval",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [220, 0],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_DEPARTMENTS}}" },
+        "filterByFormula": "={Active} = TRUE()",
+        "options": {}
+      },
+      "id": "a3-fetch-departments",
+      "name": "Airtable - Fetch Departments",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [440, 0],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst SECRET = $env.APPROVAL_LINK_SECRET;\nconst TTL_HOURS = parseInt($env.APPROVAL_LINK_TTL_HOURS || '72', 10);\nconst BASE_URL = $env.N8N_WEBHOOK_BASE_URL;\n\nfunction signToken(payload) {\n  const expiresAt = Date.now() + TTL_HOURS * 3600 * 1000;\n  const data = { ...payload, expiresAt };\n  const b64 = Buffer.from(JSON.stringify(data)).toString('base64url');\n  const hmac = crypto.createHmac('sha256', SECRET).update(b64).digest('base64url');\n  return `${b64}.${hmac}`;\n}\n\nconst invoices = $('Airtable - Find Invoices Pending Approval').all().map(i => i.json);\nconst departments = $input.all().map(d => d.json);\n\nconst out = [];\nfor (const inv of invoices) {\n  const selected = inv['Selected Departments'] || [];\n  if (selected.length === 0) {\n    out.push({ json: { skip: true, invoiceId: inv.id, reason: 'No department selected during manual review.' } });\n    continue;\n  }\n  for (const dept of selected) {\n    const deptRecord = departments.find(d => (d['Department Name'] || '').toUpperCase() === dept.toUpperCase());\n    if (!deptRecord || !deptRecord['Approver Email']) {\n      out.push({ json: { skip: true, invoiceId: inv.id, reason: `No approver configured for department ${dept}` } });\n      continue;\n    }\n    const approveToken = signToken({ invoiceRecordId: inv.id, department: dept, decision: 'approve' });\n    const rejectToken = signToken({ invoiceRecordId: inv.id, department: dept, decision: 'reject' });\n    out.push({\n      json: {\n        skip: false,\n        invoiceId: inv.id,\n        vendor: inv['Vendor'],\n        invoiceNumber: inv['Invoice Number'],\n        grossAmount: inv['Gross Amount'],\n        currency: inv['Currency'],\n        department: dept,\n        approverEmail: deptRecord['Approver Email'],\n        approveUrl: `${BASE_URL}/webhook/invoice-decision?token=${approveToken}`,\n        rejectUrl: `${BASE_URL}/webhook/invoice-decision?token=${rejectToken}`,\n        requiredDepartments: selected,\n      },\n    });\n  }\n}\nreturn out;"
+      },
+      "id": "a4-build-approval-links",
+      "name": "Build Signed Approval Links",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{$json.skip}}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "a5-if-skip",
+      "name": "IF Skip (missing approver/department)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_AUDIT}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Invoice Record": "={{[$json.invoiceId]}}",
+            "Action": "SENT_FOR_APPROVAL",
+            "Actor": "system",
+            "Outcome": "warning",
+            "Message": "={{$json.reason}}",
+            "Timestamp": "={{new Date().toISOString()}}"
+          }
+        }
+      },
+      "id": "a6-audit-skip",
+      "name": "Airtable - Audit Skip Reason",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1100, 120],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM_EMAIL}}",
+        "toEmail": "={{$json.approverEmail}}",
+        "subject": "Invoice approval needed: {{$json.vendor}} — {{$json.invoiceNumber}}",
+        "html": "=<p>Hello,</p><p>An invoice requires your approval as the <b>{{$json.department}}</b> department approver:</p><ul><li><b>Vendor:</b> {{$json.vendor}}</li><li><b>Invoice Number:</b> {{$json.invoiceNumber}}</li><li><b>Amount:</b> {{$json.grossAmount}} {{$json.currency}}</li></ul><p><a href=\"{{$json.approveUrl}}\">Approve</a> &nbsp;|&nbsp; <a href=\"{{$json.rejectUrl}}\">Reject</a></p><p>These links expire in {{$env.APPROVAL_LINK_TTL_HOURS}} hours and can each be used once.</p>"
+      },
+      "id": "a7-send-approval-email",
+      "name": "SMTP - Send Approval Request",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1100, -120],
+      "credentials": { "smtp": { "id": "smtp-cred", "name": "AP SMTP" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_AUDIT}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Invoice Record": "={{[$json.invoiceId]}}",
+            "Action": "SENT_FOR_APPROVAL",
+            "Actor": "system",
+            "Outcome": "success",
+            "Message": "=Approval request sent to {{$json.approverEmail}} for department {{$json.department}}.",
+            "Timestamp": "={{new Date().toISOString()}}"
+          }
+        }
+      },
+      "id": "a8-audit-sent",
+      "name": "Airtable - Audit Approval Sent",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1320, -120],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_INVOICES}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["id"],
+          "value": {
+            "id": "={{$json.invoiceId}}",
+            "Application Status": "Pending Approval"
+          }
+        }
+      },
+      "id": "a9-mark-pending",
+      "name": "Airtable - Mark Status Pending Approval",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1540, -120],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "invoice-decision",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a10-webhook-decision",
+      "name": "Webhook - Approve/Reject",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 400],
+      "webhookId": "invoice-decision-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst SECRET = $env.APPROVAL_LINK_SECRET;\nconst token = $json.query?.token;\n\nfunction verify(tok) {\n  const [b64, hmac] = String(tok || '').split('.');\n  if (!b64 || !hmac) throw new Error('Malformed token');\n  const expected = crypto.createHmac('sha256', SECRET).update(b64).digest('base64url');\n  const valid = crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(expected));\n  if (!valid) throw new Error('Signature mismatch - possible tampering');\n  const payload = JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));\n  if (Date.now() > payload.expiresAt) throw new Error('Token expired');\n  return payload;\n}\n\ntry {\n  const payload = verify(token);\n  return [{ json: { valid: true, ...payload } }];\n} catch (err) {\n  return [{ json: { valid: false, error: err.message } }];\n}"
+      },
+      "id": "a11-verify-token",
+      "name": "Verify Signed Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{$json.valid}}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "a12-if-valid-token",
+      "name": "IF Token Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=This approval link is invalid or has expired: {{$json.error}}. Please contact AP to have a new approval request sent.",
+        "options": { "responseCode": 400 }
+      },
+      "id": "a13-respond-invalid",
+      "name": "Respond - Invalid Token",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [660, 560]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_INVOICES}}" },
+        "id": "={{$json.invoiceRecordId}}"
+      },
+      "id": "a14-fetch-invoice",
+      "name": "Airtable - Fetch Invoice Record",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [660, 300],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const decisionCtx = $('Verify Signed Token').first().json;\nconst invoice = $input.first().json;\nconst requiredDepartments = invoice['Selected Departments'] || [];\n\n// Persist per-department decisions in a JSON blob stored on the record itself\n// (field: 'Approval Decisions', Long text JSON) to support multi-department aggregation.\nlet decisions = {};\ntry { decisions = JSON.parse(invoice['Approval Decisions'] || '{}'); } catch (e) { decisions = {}; }\ndecisions[decisionCtx.department] = decisionCtx.decision === 'approve' ? 'approved' : 'rejected';\n\nconst values = requiredDepartments.map(d => decisions[d]);\nlet aggregateStatus;\nif (values.some(v => v === 'rejected')) aggregateStatus = 'Rejected';\nelse if (values.length > 0 && values.every(v => v === 'approved')) aggregateStatus = 'Fully Approved';\nelse aggregateStatus = 'Pending Approval';\n\nreturn [{\n  json: {\n    invoiceId: invoice.id,\n    department: decisionCtx.department,\n    decision: decisionCtx.decision,\n    decisions,\n    aggregateStatus,\n    senderEmail: invoice['Sender Email'],\n    vendor: invoice['Vendor'],\n    invoiceNumber: invoice['Invoice Number'],\n  },\n}];"
+      },
+      "id": "a15-aggregate-decision",
+      "name": "Aggregate Department Decisions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_INVOICES}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["id"],
+          "value": {
+            "id": "={{$json.invoiceId}}",
+            "Application Status": "={{$json.aggregateStatus}}",
+            "Approval Decisions": "={{JSON.stringify($json.decisions)}}",
+            "Send for Approval": "={{$json.aggregateStatus === 'Pending Approval'}}"
+          }
+        }
+      },
+      "id": "a16-update-status",
+      "name": "Airtable - Update Invoice Status",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1100, 300],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_AUDIT}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Invoice Record": "={{[$json.invoiceId]}}",
+            "Action": "={{$json.decision === 'approve' ? 'APPROVAL' : 'REJECTION'}}",
+            "Actor": "={{$json.department}}",
+            "Outcome": "success",
+            "Message": "=Department {{$json.department}} recorded decision: {{$json.decision}}. Aggregate status: {{$json.aggregateStatus}}.",
+            "Changes": "={{JSON.stringify($json.decisions)}}",
+            "Timestamp": "={{new Date().toISOString()}}"
+          }
+        }
+      },
+      "id": "a17-audit-decision",
+      "name": "Airtable - Audit Decision",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1320, 300],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM_EMAIL}}",
+        "toEmail": "={{$json.senderEmail}}",
+        "subject": "Invoice {{$json.invoiceNumber}} — {{$json.aggregateStatus}}",
+        "html": "=<p>The invoice from <b>{{$json.vendor}}</b> ({{$json.invoiceNumber}}) has a new status: <b>{{$json.aggregateStatus}}</b> following the {{$json.department}} department's decision.</p>"
+      },
+      "id": "a18-notify-submitter",
+      "name": "SMTP - Notify Submitter/AP Team",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1540, 300],
+      "credentials": { "smtp": { "id": "smtp-cred", "name": "AP SMTP" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=Thank you. The invoice {{$json.invoiceNumber}} has been recorded as: {{$json.decision === 'approve' ? 'APPROVED' : 'REJECTED'}} for the {{$json.department}} department. Current overall status: {{$json.aggregateStatus}}.",
+        "options": { "responseCode": 200 }
+      },
+      "id": "a19-respond-success",
+      "name": "Respond - Decision Recorded",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [1760, 300]
+    }
+  ],
+  "connections": {
+    "Cron - Every 15 Minutes": { "main": [[{ "node": "Airtable - Find Invoices Pending Approval", "type": "main", "index": 0 }]] },
+    "Airtable - Find Invoices Pending Approval": { "main": [[{ "node": "Airtable - Fetch Departments", "type": "main", "index": 0 }]] },
+    "Airtable - Fetch Departments": { "main": [[{ "node": "Build Signed Approval Links", "type": "main", "index": 0 }]] },
+    "Build Signed Approval Links": { "main": [[{ "node": "IF Skip (missing approver/department)", "type": "main", "index": 0 }]] },
+    "IF Skip (missing approver/department)": {
+      "main": [
+        [{ "node": "Airtable - Audit Skip Reason", "type": "main", "index": 0 }],
+        [{ "node": "SMTP - Send Approval Request", "type": "main", "index": 0 }]
+      ]
+    },
+    "SMTP - Send Approval Request": { "main": [[{ "node": "Airtable - Audit Approval Sent", "type": "main", "index": 0 }]] },
+    "Airtable - Audit Approval Sent": { "main": [[{ "node": "Airtable - Mark Status Pending Approval", "type": "main", "index": 0 }]] },
+    "Webhook - Approve/Reject": { "main": [[{ "node": "Verify Signed Token", "type": "main", "index": 0 }]] },
+    "Verify Signed Token": { "main": [[{ "node": "IF Token Valid", "type": "main", "index": 0 }]] },
+    "IF Token Valid": {
+      "main": [
+        [{ "node": "Airtable - Fetch Invoice Record", "type": "main", "index": 0 }],
+        [{ "node": "Respond - Invalid Token", "type": "main", "index": 0 }]
+      ]
+    },
+    "Airtable - Fetch Invoice Record": { "main": [[{ "node": "Aggregate Department Decisions", "type": "main", "index": 0 }]] },
+    "Aggregate Department Decisions": { "main": [[{ "node": "Airtable - Update Invoice Status", "type": "main", "index": 0 }]] },
+    "Airtable - Update Invoice Status": { "main": [[{ "node": "Airtable - Audit Decision", "type": "main", "index": 0 }]] },
+    "Airtable - Audit Decision": { "main": [[{ "node": "SMTP - Notify Submitter/AP Team", "type": "main", "index": 0 }]] },
+    "SMTP - Notify Submitter/AP Team": { "main": [[{ "node": "Respond - Decision Recorded", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1.0.0",
+  "triggerCount": 2
+}
