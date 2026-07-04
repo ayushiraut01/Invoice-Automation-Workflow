@@ -1,0 +1,394 @@
+{
+  "name": "Invoice Automation - 1. Intake & Extraction",
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "={{$env.IMAP_MAILBOX || 'INBOX'}}",
+        "options": { "forceReconnect": 60 }
+      },
+      "id": "n1-imap-trigger",
+      "name": "IMAP - New Invoice Email",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "credentials": { "imap": { "id": "imap-invoices-cred", "name": "Invoices Mailbox IMAP" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst out = [];\nfor (const item of items) {\n  const binaryKeys = Object.keys(item.binary || {});\n  const pdfKeys = binaryKeys.filter((k) => {\n    const b = item.binary[k];\n    return (b.mimeType || '').toLowerCase().includes('pdf') || (b.fileName || '').toLowerCase().endsWith('.pdf');\n  });\n  if (pdfKeys.length === 0) {\n    // No PDF attachment -> not an invoice email, drop silently but log\n    continue;\n  }\n  for (const key of pdfKeys) {\n    out.push({\n      json: {\n        sender: item.json.from?.text || item.json.from || '',\n        senderEmail: (item.json.from?.value?.[0]?.address) || item.json.from || '',\n        senderName: (item.json.from?.value?.[0]?.name) || '',\n        subject: item.json.subject || '',\n        receivedAt: item.json.date || new Date().toISOString(),\n        attachmentKey: key,\n        fileName: item.binary[key].fileName || 'invoice.pdf',\n      },\n      binary: { attachment_0: item.binary[key] },\n    });\n  }\n}\nreturn out;"
+      },
+      "id": "n2-filter-pdf",
+      "name": "Filter PDF Attachments + Extract Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "attachment_0",
+        "options": { "joinPages": true }
+      },
+      "id": "n3-extract-pdf-text",
+      "name": "Extract PDF Text (No OCR)",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "cond-text-length",
+              "leftValue": "={{$json.text ? $json.text.trim().length : 0}}",
+              "rightValue": 40,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "n4-if-text-usable",
+      "name": "IF Text Extractable",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// This PDF has no usable text layer (likely a scanned image).\n// Per project constraints, NO OCR is used. Route to manual data entry.\nconst item = $input.first();\nreturn [{\n  json: {\n    ...item.json,\n    applicationStatus: 'Manual Data Entry Required',\n    anomalies: ['PDF has no extractable text layer (likely scanned). OCR is disabled by design; manual data entry required.'],\n  },\n  binary: item.binary,\n}];"
+      },
+      "id": "n5-flag-manual-entry",
+      "name": "Flag: Manual Data Entry Required",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = '/data/prompts/invoice_extraction_prompt.txt';\nlet template;\ntry {\n  template = fs.readFileSync(path, 'utf8');\n} catch (e) {\n  // Fallback: template mounted elsewhere or embedded via n8n static data\n  template = $getWorkflowStaticData('global').promptTemplate;\n}\nconst invoiceText = $json.text || '';\nconst rendered = template.replace('{{invoiceText}}', invoiceText.slice(0, 100000));\nreturn [{ json: { ...$json, renderedPrompt: rendered } }];"
+      },
+      "id": "n6-render-prompt",
+      "name": "Render Gemini Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, -100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.GEMINI_API_BASE_URL}}/models/{{$env.GEMINI_MODEL}}:generateContent?key={{$env.GEMINI_API_KEY}}",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contents\": [{ \"role\": \"user\", \"parts\": [{ \"text\": $json.renderedPrompt }] }],\n  \"generationConfig\": {\n    \"temperature\": 0.1,\n    \"topP\": 0.95,\n    \"maxOutputTokens\": 4096,\n    \"responseMimeType\": \"application/json\"\n  }\n}",
+        "options": { "timeout": 30000, "retry": { "maxTries": 1 } }
+      },
+      "id": "n7-call-gemini",
+      "name": "Call Gemini API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, -100],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse, clean, and validate Gemini's JSON output. Never trusts AI blindly.\nfunction safeParseJson(raw) {\n  if (!raw || !raw.trim()) throw new Error('Empty AI response');\n  let candidate = raw.trim();\n  const fence = candidate.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  if (fence) candidate = fence[1].trim();\n  const a = candidate.indexOf('{');\n  const b = candidate.lastIndexOf('}');\n  if (a !== -1 && b !== -1 && b > a) candidate = candidate.slice(a, b + 1);\n  return JSON.parse(candidate);\n}\nfunction toNum(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number' && Number.isFinite(v)) return v;\n  const n = parseFloat(String(v).replace(/[^0-9.\\-]/g, ''));\n  return Number.isFinite(n) ? n : null;\n}\nfunction toIsoDate(v) {\n  if (!v || typeof v !== 'string') return null;\n  return /^\\d{4}-\\d{2}-\\d{2}$/.test(v.trim()) ? v.trim() : null;\n}\n\nconst item = $input.first();\nconst candidatesText = item.json?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';\nconst parsed = safeParseJson(candidatesText);\n\nconst anomalies = Array.isArray(parsed.anomalies) ? [...parsed.anomalies] : [];\nconst netAmount = toNum(parsed.netAmount);\nconst vatAmount = toNum(parsed.vatAmount);\nconst grossAmount = toNum(parsed.grossAmount);\nif (netAmount !== null && vatAmount !== null && grossAmount !== null) {\n  const expected = Math.round((netAmount + vatAmount) * 100) / 100;\n  const actual = Math.round(grossAmount * 100) / 100;\n  if (Math.abs(expected - actual) > 0.02) anomalies.push(`Net+VAT (${expected}) != Gross (${actual})`);\n}\nconst invoiceNumber = parsed.invoiceNumber ? String(parsed.invoiceNumber).trim() : null;\nif (!invoiceNumber) anomalies.push('invoiceNumber missing.');\nconst vendor = parsed.vendor ? String(parsed.vendor).trim() : null;\nif (!vendor) anomalies.push('vendor missing.');\n\nconst cleaned = {\n  vendor,\n  vendorUid: parsed.vendorUid || null,\n  vendorIban: parsed.vendorIban ? String(parsed.vendorIban).replace(/\\s+/g, '') : null,\n  invoiceNumber,\n  invoiceDate: toIsoDate(parsed.invoiceDate),\n  dueDate: toIsoDate(parsed.dueDate),\n  netAmount, vatAmount, grossAmount,\n  vatPercent: toNum(parsed.vatPercent),\n  currency: parsed.currency ? String(parsed.currency).toUpperCase().slice(0, 3) : null,\n  costCenter: parsed.costCenter || null,\n  lineItems: Array.isArray(parsed.lineItems) ? parsed.lineItems.filter(li => li && li.description).map(li => ({ description: String(li.description).slice(0, 500), quantity: toNum(li.quantity), unitPrice: toNum(li.unitPrice), lineTotal: toNum(li.lineTotal) })) : [],\n  documentType: ['invoice','credit_note','receipt','unknown'].includes(parsed.documentType) ? parsed.documentType : 'unknown',\n  language: parsed.language || 'unknown',\n  confidence: Math.min(1, Math.max(0, toNum(parsed.confidence) || 0)),\n  anomalies,\n};\n\nconst validationErrors = [];\nif (!cleaned.invoiceNumber) validationErrors.push('missing_invoice_number');\nif (!cleaned.vendor) validationErrors.push('missing_vendor');\n\nreturn [{\n  json: { ...$('Filter PDF Attachments + Extract Metadata').first().json, extracted: cleaned, validationErrors },\n  binary: $('Filter PDF Attachments + Extract Metadata').first().binary,\n}];"
+      },
+      "id": "n8-clean-validate",
+      "name": "Clean & Validate AI Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, -100]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_INVOICES}}" },
+        "filterByFormula": "=AND({Vendor} = '{{$json.extracted.vendor}}', {Invoice Number} = '{{$json.extracted.invoiceNumber}}')",
+        "options": { "fields": ["Vendor", "Invoice Number", "Invoice Date", "Gross Amount"] }
+      },
+      "id": "n9-airtable-search-dupes",
+      "name": "Airtable - Search Possible Duplicates",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1540, -100],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "function normalize(v) { return v ? String(v).trim().toUpperCase().replace(/[^A-Z0-9]/g, '') : ''; }\nconst extracted = $('Clean & Validate AI Output').first().json.extracted;\nconst existing = $input.all();\nconst amountKey = (extracted.grossAmount ?? 'NA');\nconst candidateKey = [normalize(extracted.vendor), normalize(extracted.invoiceNumber), normalize(extracted.invoiceDate), amountKey].join('|');\nlet isDuplicate = false;\nlet matches = [];\nfor (const rec of existing) {\n  const f = rec.json;\n  const existingKey = [normalize(f['Vendor']), normalize(f['Invoice Number']), normalize(f['Invoice Date']), f['Gross Amount'] ?? 'NA'].join('|');\n  if (existingKey === candidateKey) { isDuplicate = true; matches.push(rec.json.id); }\n}\nconst base = $('Clean & Validate AI Output').first().json;\nreturn [{ json: { ...base, duplicateCheck: { isDuplicate, matches } } }];"
+      },
+      "id": "n10-evaluate-dupes",
+      "name": "Evaluate Duplicate Matches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, -100]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_VENDORS}}" },
+        "options": {}
+      },
+      "id": "n11-airtable-search-vendors",
+      "name": "Airtable - Fetch Vendor Master",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1980, -100],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "function normalize(v) { return v ? String(v).trim().toUpperCase().replace(/[^A-Z0-9]/g, '') : ''; }\nfunction similarity(a, b) {\n  const s1 = normalize(a), s2 = normalize(b);\n  if (!s1 || !s2) return 0;\n  if (s1 === s2) return 1;\n  const costs = [];\n  for (let i = 0; i <= s1.length; i++) {\n    let lastValue = i;\n    for (let j = 0; j <= s2.length; j++) {\n      if (i === 0) costs[j] = j;\n      else if (j > 0) {\n        let newValue = costs[j - 1];\n        if (s1.charAt(i - 1) !== s2.charAt(j - 1)) newValue = Math.min(newValue, lastValue, costs[j]) + 1;\n        costs[j - 1] = lastValue; lastValue = newValue;\n      }\n    }\n    if (i > 0) costs[s2.length] = lastValue;\n  }\n  const distance = costs[s2.length];\n  const maxLen = Math.max(s1.length, s2.length);\n  return maxLen === 0 ? 1 : 1 - distance / maxLen;\n}\n\nconst base = $('Evaluate Duplicate Matches').first().json;\nconst extracted = base.extracted;\nconst vendors = $input.all().map(v => v.json);\nlet status = 'unknown', matchedVendorId = null, confidence = 0;\nconst warnings = [];\n\nif (extracted.vendorUid) {\n  const uidMatch = vendors.find(v => normalize(v['Vendor UID']) === normalize(extracted.vendorUid));\n  if (uidMatch) { status = 'known'; matchedVendorId = uidMatch.id; confidence = 0.98; }\n}\nif (status === 'unknown') {\n  const nameMatch = vendors.find(v => normalize(v['Vendor Name']) === normalize(extracted.vendor));\n  if (nameMatch) {\n    status = 'known'; matchedVendorId = nameMatch.id; confidence = 0.95;\n    if (extracted.vendorIban && nameMatch['IBAN'] && normalize(nameMatch['IBAN']) !== normalize(extracted.vendorIban)) {\n      warnings.push('IBAN differs from vendor master - possible payment redirection fraud.');\n    }\n  }\n}\nif (status === 'unknown') {\n  let best = null, bestScore = 0;\n  for (const v of vendors) { const s = similarity(v['Vendor Name'], extracted.vendor); if (s > bestScore) { bestScore = s; best = v; } }\n  if (best && bestScore >= 0.8) { status = 'possible_match'; matchedVendorId = best.id; confidence = bestScore; warnings.push(`Vendor name close to \"${best['Vendor Name']}\" (similarity ${bestScore.toFixed(2)})`); }\n  else warnings.push(`Vendor \"${extracted.vendor}\" not found in master - requires onboarding/verification.`);\n}\n\n// Cost center prediction (keyword fallback; vendor history omitted here for brevity, extend as needed)\nconst KEYWORD_RULES = [\n  { costCenter: 'IT-OPS', keywords: ['software','saas','subscription','cloud','hosting','license'] },\n  { costCenter: 'MARKETING', keywords: ['advertising','campaign','marketing','branding','seo'] },\n  { costCenter: 'FACILITIES', keywords: ['rent','lease','cleaning','utilities','maintenance'] },\n  { costCenter: 'TRAVEL', keywords: ['flight','hotel','airfare','travel','taxi'] },\n  { costCenter: 'LEGAL', keywords: ['legal','attorney','law firm','compliance'] },\n  { costCenter: 'HR', keywords: ['recruiting','payroll','benefits','training'] },\n  { costCenter: 'LOGISTICS', keywords: ['shipping','freight','courier','logistics'] },\n];\nlet predictedCC = extracted.costCenter, ccSource = extracted.costCenter ? 'AI Extracted' : null;\nif (!predictedCC) {\n  const haystack = [extracted.vendor || '', ...(extracted.lineItems || []).map(li => li.description || '')].join(' ').toLowerCase();\n  let bestMatch = null, bestScore = 0;\n  for (const rule of KEYWORD_RULES) {\n    const score = rule.keywords.reduce((acc, kw) => acc + (haystack.includes(kw) ? 1 : 0), 0);\n    if (score > bestScore) { bestScore = score; bestMatch = rule.costCenter; }\n  }\n  if (bestMatch) { predictedCC = bestMatch; ccSource = 'Predicted'; }\n}\n\nreturn [{ json: { ...base, vendorValidation: { status, matchedVendorId, confidence, warnings }, predictedCostCenter: predictedCC, costCenterSource: ccSource } }];"
+      },
+      "id": "n12-vendor-cost-center",
+      "name": "Vendor Validation + Cost Center Prediction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, -100]
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "operation": "upload",
+        "name": "={{$json.extracted.invoiceNumber || 'invoice'}}_{{$json.fileName}}",
+        "driveId": { "mode": "list", "value": "My Drive" },
+        "folderId": { "mode": "id", "value": "={{$env.GOOGLE_DRIVE_FOLDER_ID}}" },
+        "binaryDataUpload": true,
+        "binaryPropertyName": "attachment_0",
+        "options": {}
+      },
+      "id": "n13-upload-drive",
+      "name": "Upload PDF to Google Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [2420, -100],
+      "credentials": { "googleDriveOAuth2Api": { "id": "gdrive-cred", "name": "Google Drive OAuth2" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Vendor Validation + Cost Center Prediction').first().json;\nconst drive = $input.first().json;\nconst driveLink = drive.webViewLink || drive.webContentLink || '';\nconst isDuplicate = base.duplicateCheck?.isDuplicate;\nconst extracted = base.extracted;\n\nconst applicationStatus = isDuplicate ? 'Draft' : 'Draft'; // duplicates still created as Draft but flagged, human decides\n\nreturn [{ json: { ...base, driveLink, applicationStatus } }];"
+      },
+      "id": "n14-prepare-record",
+      "name": "Prepare Invoice Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2640, -100]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_INVOICES}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Vendor": "={{$json.extracted.vendor}}",
+            "Vendor UID": "={{$json.extracted.vendorUid}}",
+            "Vendor IBAN": "={{$json.extracted.vendorIban}}",
+            "Vendor Status": "={{$json.vendorValidation.status === 'known' ? 'Known' : ($json.vendorValidation.status === 'possible_match' ? 'Possible Match' : 'Unknown')}}",
+            "Invoice Number": "={{$json.extracted.invoiceNumber}}",
+            "Invoice Date": "={{$json.extracted.invoiceDate}}",
+            "Due Date": "={{$json.extracted.dueDate}}",
+            "Net Amount": "={{$json.extracted.netAmount}}",
+            "VAT Amount": "={{$json.extracted.vatAmount}}",
+            "VAT %": "={{$json.extracted.vatPercent}}",
+            "Gross Amount": "={{$json.extracted.grossAmount}}",
+            "Currency": "={{$json.extracted.currency}}",
+            "Cost Center": "={{$json.predictedCostCenter}}",
+            "Cost Center Source": "={{$json.costCenterSource}}",
+            "Line Items": "={{JSON.stringify($json.extracted.lineItems)}}",
+            "Confidence": "={{$json.extracted.confidence}}",
+            "Anomalies": "={{JSON.stringify($json.extracted.anomalies)}}",
+            "Duplicate Flag": "={{$json.duplicateCheck.isDuplicate}}",
+            "Application Status": "={{$json.applicationStatus}}",
+            "Send for Approval": false,
+            "Source": "Email",
+            "Sender": "={{$json.sender}}",
+            "Sender Email": "={{$json.senderEmail}}",
+            "Sender Name": "={{$json.senderName}}",
+            "Email Subject": "={{$json.subject}}",
+            "Email Received": true,
+            "Received At": "={{$json.receivedAt}}",
+            "PDF Drive Link": "={{$json.driveLink}}"
+          }
+        }
+      },
+      "id": "n15-create-invoice-record",
+      "name": "Airtable - Create Invoice Record",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [2860, -100],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_AUDIT}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Invoice Record": "={{[$json.id]}}",
+            "Action": "RECORD_CREATED",
+            "Actor": "system",
+            "Outcome": "success",
+            "Message": "Invoice extracted via Gemini, validated, and stored as Draft.",
+            "Changes": "={{JSON.stringify($json)}}",
+            "Timestamp": "={{new Date().toISOString()}}"
+          }
+        }
+      },
+      "id": "n16-audit-record-created",
+      "name": "Airtable - Write Audit Trail",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [3080, -100],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_INVOICES}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Status": "Manual Data Entry Required",
+            "Send for Approval": false,
+            "Source": "Email",
+            "Sender": "={{$json.sender}}",
+            "Sender Email": "={{$json.senderEmail}}",
+            "Sender Name": "={{$json.senderName}}",
+            "Email Subject": "={{$json.subject}}",
+            "Email Received": true,
+            "Received At": "={{$json.receivedAt}}",
+            "Anomalies": "={{JSON.stringify($json.anomalies)}}"
+          }
+        }
+      },
+      "id": "n17-create-manual-entry-record",
+      "name": "Airtable - Create Manual-Entry Placeholder",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1100, 160],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM_EMAIL}}",
+        "toEmail": "={{$env.AP_TEAM_ALERT_EMAIL}}",
+        "subject": "Manual data entry required: {{$json.subject}}",
+        "text": "=A PDF invoice could not be automatically processed because it has no extractable text layer (likely a scan). OCR is disabled by design.\n\nSender: {{$json.senderName}} <{{$json.senderEmail}}>\nSubject: {{$json.subject}}\nReceived: {{$json.receivedAt}}\n\nPlease open the Airtable record and key in the invoice details manually."
+      },
+      "id": "n18-notify-manual-entry",
+      "name": "SMTP - Notify AP Team (Manual Entry)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1320, 160],
+      "credentials": { "smtp": { "id": "smtp-cred", "name": "AP SMTP" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gemini call failed after retries -> build dead-letter payload\nconst item = $input.first();\nconst base = $('Filter PDF Attachments + Extract Metadata').first().json;\nreturn [{\n  json: {\n    stage: 'AI_EXTRACTION',\n    errorMessage: item.json?.error?.message || item.error?.message || 'Unknown Gemini error',\n    payload: JSON.stringify(base).slice(0, 90000),\n    timestamp: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "n19-build-dlq-entry",
+      "name": "Build Dead-Letter Entry (AI Failure)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, -260]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "={{$env.AIRTABLE_BASE_ID}}" },
+        "table": { "value": "={{$env.AIRTABLE_TABLE_ERRORS}}" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Stage": "={{$json.stage}}",
+            "Error Message": "={{$json.errorMessage}}",
+            "Payload": "={{$json.payload}}",
+            "Status": "Unresolved",
+            "Timestamp": "={{$json.timestamp}}"
+          }
+        }
+      },
+      "id": "n20-write-dlq",
+      "name": "Airtable - Write Dead Letter Queue",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1540, -260],
+      "credentials": { "airtableTokenApi": { "id": "airtable-cred", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM_EMAIL}}",
+        "toEmail": "={{$env.AP_TEAM_ALERT_EMAIL}}",
+        "subject": "AI extraction failed for invoice email: {{$json.stage}}",
+        "text": "=Gemini extraction failed after retries.\n\nStage: {{$json.stage}}\nError: {{$json.errorMessage}}\nTime: {{$json.timestamp}}\n\nSee DeadLetterQueue table in Airtable for the full payload."
+      },
+      "id": "n21-notify-ai-failure",
+      "name": "SMTP - Notify AP Team (AI Failure)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1760, -260],
+      "credentials": { "smtp": { "id": "smtp-cred", "name": "AP SMTP" } }
+    }
+  ],
+  "connections": {
+    "IMAP - New Invoice Email": { "main": [[{ "node": "Filter PDF Attachments + Extract Metadata", "type": "main", "index": 0 }]] },
+    "Filter PDF Attachments + Extract Metadata": { "main": [[{ "node": "Extract PDF Text (No OCR)", "type": "main", "index": 0 }]] },
+    "Extract PDF Text (No OCR)": { "main": [[{ "node": "IF Text Extractable", "type": "main", "index": 0 }]] },
+    "IF Text Extractable": {
+      "main": [
+        [{ "node": "Render Gemini Prompt", "type": "main", "index": 0 }],
+        [{ "node": "Flag: Manual Data Entry Required", "type": "main", "index": 0 }]
+      ]
+    },
+    "Flag: Manual Data Entry Required": { "main": [[{ "node": "Airtable - Create Manual-Entry Placeholder", "type": "main", "index": 0 }]] },
+    "Airtable - Create Manual-Entry Placeholder": { "main": [[{ "node": "SMTP - Notify AP Team (Manual Entry)", "type": "main", "index": 0 }]] },
+    "Render Gemini Prompt": { "main": [[{ "node": "Call Gemini API", "type": "main", "index": 0 }]] },
+    "Call Gemini API": {
+      "main": [
+        [{ "node": "Clean & Validate AI Output", "type": "main", "index": 0 }],
+        [{ "node": "Build Dead-Letter Entry (AI Failure)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Dead-Letter Entry (AI Failure)": { "main": [[{ "node": "Airtable - Write Dead Letter Queue", "type": "main", "index": 0 }]] },
+    "Airtable - Write Dead Letter Queue": { "main": [[{ "node": "SMTP - Notify AP Team (AI Failure)", "type": "main", "index": 0 }]] },
+    "Clean & Validate AI Output": { "main": [[{ "node": "Airtable - Search Possible Duplicates", "type": "main", "index": 0 }]] },
+    "Airtable - Search Possible Duplicates": { "main": [[{ "node": "Evaluate Duplicate Matches", "type": "main", "index": 0 }]] },
+    "Evaluate Duplicate Matches": { "main": [[{ "node": "Airtable - Fetch Vendor Master", "type": "main", "index": 0 }]] },
+    "Airtable - Fetch Vendor Master": { "main": [[{ "node": "Vendor Validation + Cost Center Prediction", "type": "main", "index": 0 }]] },
+    "Vendor Validation + Cost Center Prediction": { "main": [[{ "node": "Upload PDF to Google Drive", "type": "main", "index": 0 }]] },
+    "Upload PDF to Google Drive": { "main": [[{ "node": "Prepare Invoice Record", "type": "main", "index": 0 }]] },
+    "Prepare Invoice Record": { "main": [[{ "node": "Airtable - Create Invoice Record", "type": "main", "index": 0 }]] },
+    "Airtable - Create Invoice Record": { "main": [[{ "node": "Airtable - Write Audit Trail", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1.0.0",
+  "triggerCount": 1
+}
