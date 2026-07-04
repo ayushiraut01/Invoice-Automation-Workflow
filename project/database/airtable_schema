@@ -1,0 +1,117 @@
+# Airtable Base Schema — Invoice Automation
+
+Create one Airtable base with 4 tables exactly as below. Field names must
+match exactly — the workflow JSON references these names literally.
+
+---
+
+## Table 1: `Invoices`
+
+| Field Name           | Type                     | Notes / Options |
+|-----------------------|--------------------------|------------------|
+| Invoice ID            | Autonumber (primary)     | Airtable-generated |
+| Vendor                | Single line text         | |
+| Vendor UID             | Single line text         | Tax ID / registration number |
+| Vendor IBAN            | Single line text         | |
+| Vendor Match           | Link to `Vendors`        | Populated by vendor validation |
+| Vendor Status          | Single select             | `Known`, `Possible Match`, `Unknown` |
+| Invoice Number         | Single line text         | |
+| Invoice Date           | Date                      | ISO 8601 |
+| Due Date               | Date                      | ISO 8601 |
+| Net Amount             | Currency (2 decimals)     | |
+| VAT Amount             | Currency (2 decimals)     | |
+| VAT %                  | Percent                   | |
+| Gross Amount           | Currency (2 decimals)     | |
+| Currency               | Single select              | ISO-4217 codes: USD, EUR, GBP, etc. |
+| Cost Center            | Single select              | IT-OPS, MARKETING, FACILITIES, TRAVEL, LEGAL, HR, LOGISTICS, OTHER |
+| Cost Center Source     | Single select              | `AI Extracted`, `Predicted`, `Manual` |
+| Line Items             | Long text (JSON)          | Array of `{description, quantity, unitPrice, lineTotal}` |
+| Confidence             | Number (0–1, 2 decimals)  | AI confidence score |
+| Anomalies              | Long text (JSON array)    | |
+| Duplicate Flag         | Checkbox                  | |
+| Duplicate Of           | Link to `Invoices`        | Self-link, set if duplicate detected |
+| Application Status     | Single select              | `Draft`, `Manual Data Entry Required`, `AI Extraction Failed`, `Pending Approval`, `Fully Approved`, `Rejected` |
+| Selected Departments   | Multiple select            | Same values as Departments table |
+| Send for Approval      | Checkbox                  | Default `false` |
+| Source                 | Single select              | `Email` |
+| Sender                 | Single line text          | |
+| Sender Email           | Email                      | |
+| Sender Name            | Single line text          | |
+| Email Subject          | Single line text          | |
+| Email Received         | Checkbox                  | Default `true` |
+| Received At             | Date + time                | |
+| PDF Attachment          | Attachment                 | Stores Google Drive shareable link as attachment |
+| PDF Drive Link          | URL                         | Raw Drive link (backup reference) |
+| Created At               | Created time (auto)        | |
+| Last Modified            | Last modified time (auto)  | |
+
+**Formula field (optional, for dashboards):**
+`Days Until Due` = `DATETIME_DIFF({Due Date}, TODAY(), 'days')`
+
+---
+
+## Table 2: `Vendors`
+
+| Field Name    | Type              | Notes |
+|----------------|-------------------|-------|
+| Vendor Name    | Single line text (primary) | |
+| Vendor UID     | Single line text | Tax ID |
+| IBAN           | Single line text | |
+| Default Cost Center | Single select | Same option set as Invoices.Cost Center |
+| Status         | Single select    | `Active`, `Onboarding`, `Blocked` |
+| Invoices       | Link to `Invoices` | Reverse link (auto-created) |
+| Notes          | Long text        | |
+
+---
+
+## Table 3: `Departments`
+
+| Field Name       | Type              | Notes |
+|-------------------|-------------------|-------|
+| Department Name   | Single line text (primary) | Must match `Selected Departments` options in Invoices |
+| Approver Email    | Email             | |
+| Backup Approver Email | Email         | Optional |
+| Active            | Checkbox          | |
+
+Seed rows example:
+
+| Department Name | Approver Email |
+|---|---|
+| FINANCE | finance-approver@company.com |
+| IT-OPS | it-approver@company.com |
+| MARKETING | marketing-approver@company.com |
+| FACILITIES | facilities-approver@company.com |
+| TRAVEL | travel-approver@company.com |
+| LEGAL | legal-approver@company.com |
+| HR | hr-approver@company.com |
+| LOGISTICS | logistics-approver@company.com |
+
+---
+
+## Table 4: `AuditTrail`
+
+| Field Name       | Type                | Notes |
+|-------------------|---------------------|-------|
+| Audit ID           | Autonumber (primary) | |
+| Invoice Record      | Link to `Invoices`   | |
+| Action              | Single select          | `EMAIL_RECEIVED`, `PDF_EXTRACTED`, `AI_EXTRACTION`, `VALIDATION`, `DUPLICATE_CHECK`, `VENDOR_VALIDATION`, `COST_CENTER_PREDICTION`, `RECORD_CREATED`, `MANUAL_REVIEW`, `SENT_FOR_APPROVAL`, `APPROVAL`, `REJECTION`, `STATUS_CHANGE`, `ERROR`, `RETRY` |
+| Actor               | Single line text       | `system` or approver/reviewer email |
+| Outcome             | Single select          | `success`, `failure`, `warning` |
+| Message             | Long text              | |
+| Changes             | Long text (JSON)       | Before/after diff or relevant payload |
+| Timestamp           | Date + time             | |
+
+---
+
+## Table 5: `DeadLetterQueue`
+
+| Field Name       | Type              | Notes |
+|-------------------|-------------------|-------|
+| DLQ ID             | Autonumber (primary) | |
+| Stage              | Single select        | `PDF_EXTRACTION`, `AI_EXTRACTION`, `VALIDATION`, `AIRTABLE_WRITE`, `DRIVE_UPLOAD`, `EMAIL_SEND` |
+| Error Message       | Long text            | |
+| Payload             | Long text (JSON)     | Truncated raw payload for debugging |
+| Invoice Record       | Link to `Invoices`   | Optional |
+| Attempts            | Number                | |
+| Status              | Single select         | `Unresolved`, `Retried`, `Resolved`, `Ignored` |
+| Timestamp           | Date + time            | |
